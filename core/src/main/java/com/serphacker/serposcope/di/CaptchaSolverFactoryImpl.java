@@ -12,7 +12,7 @@ import com.serphacker.serposcope.scraper.captcha.solver.AntiCaptchaSolver;
 import com.serphacker.serposcope.scraper.captcha.solver.CaptchaSolver;
 import com.serphacker.serposcope.scraper.captcha.solver.DeathByCaptchaSolver;
 import com.serphacker.serposcope.scraper.captcha.solver.DecaptcherSolver;
-import com.serphacker.serposcope.scraper.captcha.solver.FailoverCaptchaSolver;
+import com.serphacker.serposcope.scraper.captcha.solver.RandomCaptchaSolver;
 import com.serphacker.serposcope.scraper.captcha.solver.SwingUICaptchaSolver;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -60,7 +60,7 @@ public class CaptchaSolverFactoryImpl implements CaptchaSolverFactory {
         }
         
         Collections.shuffle(solvers);
-        return new FailoverCaptchaSolver(solvers);
+        return new RandomCaptchaSolver(solvers);
     }
     
     protected boolean init(CaptchaSolver solver){

@@ -9,17 +9,21 @@ package com.serphacker.serposcope.scraper.google.scraper;
 
 import com.serphacker.serposcope.scraper.captcha.Captcha;
 import com.serphacker.serposcope.scraper.captcha.CaptchaImage;
+import com.serphacker.serposcope.scraper.captcha.CaptchaRecaptcha;
 import com.serphacker.serposcope.scraper.captcha.solver.CaptchaSolver;
 import com.serphacker.serposcope.scraper.google.GoogleScrapResult;
 import com.serphacker.serposcope.scraper.google.GoogleScrapResult.Status;
 import com.serphacker.serposcope.scraper.google.GoogleScrapSearch;
 import com.serphacker.serposcope.scraper.http.ScrapClient;
 import com.serphacker.serposcope.scraper.http.proxy.DirectNoProxy;
+import java.io.File;
 import java.io.UnsupportedEncodingException;
 import java.net.URLEncoder;
 import java.nio.charset.Charset;
+import java.nio.file.Files;
 import java.util.ArrayList;
 import java.util.Base64;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Random;
@@ -94,7 +98,7 @@ public class GoogleScraper {
                 
                 LOG.debug("GET {} via {} try {}", url, http.getProxy() == null ? new DirectNoProxy() : http.getProxy(), retry+1);
                 
-                status = downloadSerp(url, referrer, search);
+                status = downloadSerp(url, referrer, search, retry);
                 if(status == Status.OK){
                     status = parseSerp(urls);
                     if(status == Status.OK){
@@ -145,7 +149,6 @@ public class GoogleScraper {
         
         if("com".equals(search.getTld())){
             http.addCookie(NCR_COOKIE);
-//            http.get("https://www.google.com/ncr");
         }
 
         String hostname = "www.google.com";
@@ -169,7 +172,7 @@ public class GoogleScraper {
         }
     }
     
-    protected Status downloadSerp(String url, String referrer, GoogleScrapSearch search){
+    protected Status downloadSerp(String url, String referrer, GoogleScrapSearch search, int retry){
         if(referrer == null){
             referrer = "https://www.google." + search.getTld();
         }
@@ -180,10 +183,14 @@ public class GoogleScraper {
         switch(status){
             case 200:
                 return Status.OK;
+                
+            case 403:
+                try{Thread.sleep((retry+1)*1000);}catch(Exception ex){}
+                break;
 
             case 302:
                 ++captchas;
-                return handleCaptchaRedirect(http.getResponseHeader("location"));
+                return handleCaptchaRedirect(url, referrer, http.getResponseHeader("location"));
         }
         
         return Status.ERROR_NETWORK;
@@ -357,13 +364,30 @@ public class GoogleScraper {
     }    
     
     final static Pattern PATTERN_CAPTCHA_ID = Pattern.compile("/sorry/image\\?id=([0-9]+)&?");
-    protected Status handleCaptchaRedirect(String captchaRedirect){
-        if(captchaRedirect == null || !captchaRedirect.contains("?continue=")){
+    protected Status handleCaptchaRedirect(String url, String referrer, String redirect){
+        
+        http.clearCookies();
+        if(redirect.contains(".com/search")){
+            http.addCookie(NCR_COOKIE);
+        }
+        
+        int status = http.get(url, referrer);
+        LOG.info("GOT[refetch] status=[{}] exception=[{}]", status, http.getException() == null ? "none" : 
+            (http.getException().getClass().getSimpleName() + " : " + http.getException().getMessage()));
+        if(status == 200){
+            return Status.OK;
+        }
+        
+        if(status == 302){
+            redirect = http.getResponseHeader("location");
+        }
+        
+        if(redirect == null || !redirect.contains("?continue=")){
             return Status.ERROR_NETWORK;
         }
-        LOG.debug("captcha form detected via {}", http.getProxy() == null ? new DirectNoProxy() : http.getProxy());
         
-        int status = http.get(captchaRedirect);
+        LOG.debug("captcha form detected via {}", http.getProxy() == null ? new DirectNoProxy() : http.getProxy());
+        status = http.get(redirect);
         if(status == 403){
             return Status.ERROR_IP_BANNED;
         }
@@ -377,8 +401,128 @@ public class GoogleScraper {
             return Status.ERROR_NETWORK;
         }
         
+        Document doc = Jsoup.parse(content, redirect);
+        
+        Elements noscript = doc.getElementsByTag("noscript");
+        if(!noscript.isEmpty()){
+            LOG.debug("noscript form detected, trying with captcha image");
+            return noscriptCaptchaForm(doc, redirect);
+//            if(Status.OK.equals(ret)){
+//                return ret;
+//            }
+        }
+        
+        LOG.debug("trying with captcha recaptcha");
+        return recaptchaForm(doc, redirect);
+    }    
+    
+    protected Status recaptchaForm(Document doc, String captchaRedirect){
+        
+        Elements siteKeys = doc.getElementsByAttribute("data-sitekey");
+        if(siteKeys.isEmpty()){
+            debugDump("missing-data-sitekey-1", doc.toString());
+            LOG.debug("recaptcha sitekey not detected (1)");
+            return Status.ERROR_NETWORK;            
+        }
+        
+        String siteKey = siteKeys.first().attr("data-sitekey");
+        if(siteKey.isEmpty()){
+            debugDump("missing-data-sitekey-2", doc.toString());
+            LOG.debug("recaptcha sitekey not detected (2)");
+            return Status.ERROR_NETWORK;
+        }
+        
+        Element form = siteKeys.first().parent();
+        if(form == null){
+            LOG.debug("can't find captcha form (recaptcha)");
+            return Status.ERROR_NETWORK;            
+        }
+        
+        Map<String,Object> map = new HashMap<>();
+        Elements inputs = form.getElementsByTag("input");
+        String formAction = form.attr("abs:action");
+        for (Element input : inputs) {
+            
+            if("noscript".equals(input.parent().tagName())){
+                continue;
+            }
+            
+            String name = input.attr("name") == null ? "" : input.attr("name");
+            String value = input.attr("value") == null ? "" : input.attr("value");
+            
+            if(name.isEmpty()){
+                continue;
+            }
+            
+            map.put(name, value);
+        }
+        
+        if(map.isEmpty()){
+            LOG.debug("inputs empty (recaptcha)");
+            return Status.ERROR_NETWORK;
+        }
+        
+        if(formAction == null){
+            LOG.debug("form action is null (recaptcha)");
+            return Status.ERROR_NETWORK;            
+        }
+        
+        CaptchaRecaptcha captcha = new CaptchaRecaptcha(siteKey, captchaRedirect);
+        boolean solved = solver.solve(captcha);
+        if(!solved || !Captcha.Status.SOLVED.equals(captcha.getStatus())){
+            LOG.error("solver can't resolve captcha error = {}", captcha.getError());
+            if(Captcha.Error.SERVICE_OVERLOADED.equals(captcha.getError())){
+                LOG.warn("server is overloaded, increase maximum BID on {}", captcha.getLastSolver().getFriendlyName());
+            }
+            return Status.ERROR_CAPTCHA_INCORRECT;
+        }
+        LOG.debug("got captcha response {} in {} seconds from {}", captcha.getResponse(), captcha.getSolveDuration()/1000l, 
+            (captcha.getLastSolver() == null ? "?" : captcha.getLastSolver().getFriendlyName())
+        );
+        map.put("g-recaptcha-response", captcha.getResponse());
+        
+        int postCaptchaStatus = http.post(formAction, map, ScrapClient.PostType.URL_ENCODED, "utf-8", captchaRedirect);
+        if(postCaptchaStatus == 302){
+            String redirectOnSuccess = http.getResponseHeader("location");
+            if(redirectOnSuccess.startsWith("http://")){
+                redirectOnSuccess = "https://" + redirectOnSuccess.substring(7);
+            }
+            
+            int redirect1status = http.get(redirectOnSuccess, captchaRedirect);
+            if(redirect1status == 200){
+                return Status.OK;
+            }
+            
+            if(redirect1status == 302){
+                if(http.get(http.getResponseHeader("location"), captchaRedirect) == 200){
+                    return Status.OK;
+                }
+            }
+        }
+        
+        if(postCaptchaStatus == 503){
+            LOG.debug("Failed to resolve captcha (incorrect response = {}) (recaptcha)", captcha.getResponse());
+//            solver.reportIncorrect(captcha);
+        }
+        
+        return Status.ERROR_CAPTCHA_INCORRECT;
+    }
+    
+    protected void debugDump(String name, String data){
+        if(name == null || data == null){
+            return;
+        }
+        File dumpFile = new File(System.getProperty("java.io.tmpdir") + File.separator + name + ".txt");
+        try {
+            Files.write(dumpFile.toPath(), data.getBytes());
+        }catch(Exception ex){
+        }
+        LOG.debug("debug dump created in {}", dumpFile.getAbsolutePath());
+    }
+    
+    protected Status noscriptCaptchaForm(Document captchaDocument, String captchaRedirect){
+                
         String imageSrc = null;
-        Document captchaDocument = Jsoup.parse(content, captchaRedirect);
         Elements elements = captchaDocument.getElementsByTag("img");
         for (Element element : elements) {
             String src = element.attr("abs:src");
@@ -476,7 +620,7 @@ public class GoogleScraper {
         }
         
         return Status.ERROR_CAPTCHA_INCORRECT;
-    }    
+    }
     
     public ScrapClient getHttp() {
         return http;
